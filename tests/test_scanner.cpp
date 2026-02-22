@@ -1,5 +1,6 @@
 #include "synscan/output.h"
 #include "synscan/packet.h"
+#include "synscan/platform.h"
 #include "test_helpers.h"
 
 #include <unordered_map>

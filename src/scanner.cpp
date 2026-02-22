@@ -1,9 +1,8 @@
 #include "synscan/scanner.h"
 #include "synscan/packet.h"
+#include "synscan/platform.h"
 
 #include <netdb.h>
-#include <arpa/inet.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <cstring>

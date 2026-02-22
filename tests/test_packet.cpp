@@ -1,14 +1,50 @@
 #include "synscan/packet.h"
+#include "synscan/platform.h"
 #include "test_helpers.h"
-
-#include <arpa/inet.h>
-#include <netinet/ip.h>
-#include <netinet/tcp.h>
 
 #include <cstring>
 #include <vector>
 
 using namespace synscan;
+
+// ---------------------------------------------------------------------------
+// Portable byte-read helpers (mirror the offset constants from packet.cpp)
+// ---------------------------------------------------------------------------
+
+static inline uint8_t  pkt_u8(const std::vector<uint8_t>& p, std::size_t off) {
+    return p[off];
+}
+
+static inline uint16_t pkt_u16(const std::vector<uint8_t>& p, std::size_t off) {
+    return static_cast<uint16_t>(p[off] << 8 | p[off + 1]);
+}
+
+static inline uint32_t pkt_addr(const std::vector<uint8_t>& p, std::size_t off) {
+    uint32_t val;
+    std::memcpy(&val, &p[off], 4);
+    return val; // network byte order
+}
+
+// IPv4 offsets
+static constexpr std::size_t OFF_IP_VER_IHL  = 0;
+static constexpr std::size_t OFF_IP_TOT_LEN  = 2;
+static constexpr std::size_t OFF_IP_TTL      = 8;
+static constexpr std::size_t OFF_IP_PROTOCOL = 9;
+static constexpr std::size_t OFF_IP_SRC_ADDR = 12;
+static constexpr std::size_t OFF_IP_DST_ADDR = 16;
+static constexpr std::size_t OFF_IP_HDR_LEN  = 20;
+
+// TCP offsets (relative to TCP header start)
+static constexpr std::size_t TCP_SRC_PORT = 0;
+static constexpr std::size_t TCP_DST_PORT = 2;
+static constexpr std::size_t TCP_DATA_OFF = 12;
+static constexpr std::size_t TCP_FLAGS    = 13;
+
+// TCP flag bits
+static constexpr uint8_t FLAG_FIN = 0x01;
+static constexpr uint8_t FLAG_SYN = 0x02;
+static constexpr uint8_t FLAG_RST = 0x04;
+static constexpr uint8_t FLAG_ACK = 0x10;
 
 // ---------------------------------------------------------------------------
 // ip_checksum tests
@@ -53,7 +89,7 @@ static void test_checksum_odd_length() {
 }
 
 // ---------------------------------------------------------------------------
-// build_syn_packet tests
+// build_syn_packet tests — all use portable byte reads
 // ---------------------------------------------------------------------------
 
 static void test_build_packet_size() {
@@ -63,18 +99,20 @@ static void test_build_packet_size() {
 
 static void test_build_ip_fields() {
     auto pkt = build_syn_packet("192.168.1.100", 443, "192.168.1.1");
-    auto* ip = reinterpret_cast<const struct iphdr*>(pkt.data());
 
-    ASSERT_EQ(ip->version, 4u);
-    ASSERT_EQ(ip->ihl, 5u);
-    ASSERT_EQ(ntohs(ip->tot_len), 40u);
-    ASSERT_EQ(ip->ttl, 64u);
-    ASSERT_EQ(ip->protocol, static_cast<unsigned>(IPPROTO_TCP));
+    // version=4, ihl=5 → 0x45
+    ASSERT_EQ(pkt_u8(pkt, OFF_IP_VER_IHL), 0x45u);
+    // total length = 40
+    ASSERT_EQ(pkt_u16(pkt, OFF_IP_TOT_LEN), 40u);
+    // TTL
+    ASSERT_EQ(pkt_u8(pkt, OFF_IP_TTL), 64u);
+    // protocol = TCP (6)
+    ASSERT_EQ(pkt_u8(pkt, OFF_IP_PROTOCOL), static_cast<unsigned>(IPPROTO_TCP));
 
     // Destination address should match.
     uint32_t expected_dst = 0;
     inet_pton(AF_INET, "192.168.1.100", &expected_dst);
-    ASSERT_EQ(ip->daddr, expected_dst);
+    ASSERT_EQ(pkt_addr(pkt, OFF_IP_DST_ADDR), expected_dst);
 }
 
 static void test_build_ip_checksum_valid() {
@@ -86,28 +124,25 @@ static void test_build_ip_checksum_valid() {
 
 static void test_build_tcp_syn_flag() {
     auto pkt = build_syn_packet("10.0.0.1", 80, "10.0.0.2");
-    auto* tcp = reinterpret_cast<const struct tcphdr*>(pkt.data() + 20);
+    uint8_t flags = pkt_u8(pkt, OFF_IP_HDR_LEN + TCP_FLAGS);
 
-    ASSERT_EQ(tcp->syn, 1u);
-    ASSERT_EQ(tcp->ack, 0u);
-    ASSERT_EQ(tcp->rst, 0u);
-    ASSERT_EQ(tcp->fin, 0u);
+    ASSERT_TRUE((flags & FLAG_SYN) != 0);
+    ASSERT_TRUE((flags & FLAG_ACK) == 0);
+    ASSERT_TRUE((flags & FLAG_RST) == 0);
+    ASSERT_TRUE((flags & FLAG_FIN) == 0);
 }
 
 static void test_build_tcp_dst_port() {
     auto pkt = build_syn_packet("10.0.0.1", 8080, "10.0.0.2");
-    auto* tcp = reinterpret_cast<const struct tcphdr*>(pkt.data() + 20);
-
-    ASSERT_EQ(ntohs(tcp->dest), 8080u);
+    uint16_t dst_port = pkt_u16(pkt, OFF_IP_HDR_LEN + TCP_DST_PORT);
+    ASSERT_EQ(dst_port, 8080u);
 }
 
 static void test_build_ephemeral_src_port() {
     auto pkt = build_syn_packet("10.0.0.1", 80, "10.0.0.2");
-    auto* tcp = reinterpret_cast<const struct tcphdr*>(pkt.data() + 20);
-    uint16_t src = ntohs(tcp->source);
-
-    ASSERT_TRUE(src >= 49152);
-    ASSERT_TRUE(src <= 65535);
+    uint16_t src_port = pkt_u16(pkt, OFF_IP_HDR_LEN + TCP_SRC_PORT);
+    ASSERT_TRUE(src_port >= 49152);
+    ASSERT_TRUE(src_port <= 65535);
 }
 
 static void test_build_invalid_ip_throws() {
@@ -117,11 +152,10 @@ static void test_build_invalid_ip_throws() {
 
 static void test_build_source_addr_set() {
     auto pkt = build_syn_packet("10.0.0.1", 80, "192.168.1.50");
-    auto* ip = reinterpret_cast<const struct iphdr*>(pkt.data());
 
     uint32_t expected_src = 0;
     inet_pton(AF_INET, "192.168.1.50", &expected_src);
-    ASSERT_EQ(ip->saddr, expected_src);
+    ASSERT_EQ(pkt_addr(pkt, OFF_IP_SRC_ADDR), expected_src);
 }
 
 // ---------------------------------------------------------------------------

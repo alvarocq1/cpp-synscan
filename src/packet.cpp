@@ -1,11 +1,5 @@
 #include "synscan/packet.h"
-
-#include <arpa/inet.h>
-#include <netinet/ip.h>
-#include <netinet/tcp.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "synscan/platform.h"
 
 #include <cstring>
 #include <ctime>
@@ -61,6 +55,71 @@ static uint16_t tcp_checksum(uint32_t src_addr, uint32_t dst_addr,
 }
 
 // ---------------------------------------------------------------------------
+// Portable byte-write helpers for IP and TCP headers
+//
+// We avoid struct iphdr (Linux) / struct ip (BSD) overlays entirely.
+// Instead we write each field at its RFC-defined byte offset.  This is
+// portable across Linux, macOS, and any future POSIX target.
+// ---------------------------------------------------------------------------
+
+/// Write a 16-bit value in network byte order at `buf + offset`.
+static inline void put_u16(uint8_t* buf, std::size_t offset, uint16_t val) {
+    uint16_t n = htons(val);
+    std::memcpy(buf + offset, &n, 2);
+}
+
+/// Write a 32-bit value in network byte order at `buf + offset`.
+static inline void put_u32(uint8_t* buf, std::size_t offset, uint32_t val) {
+    uint32_t n = htonl(val);
+    std::memcpy(buf + offset, &n, 2);  // only used for seq/ack
+    std::memcpy(buf + offset, &n, 4);
+}
+
+/// Read a 32-bit value in network byte order from `buf + offset`.
+static inline uint32_t get_u32_net(const uint8_t* buf, std::size_t offset) {
+    uint32_t val;
+    std::memcpy(&val, buf + offset, 4);
+    return val; // stays in network byte order
+}
+
+// IPv4 header field offsets (RFC 791)
+namespace ip {
+    constexpr std::size_t VER_IHL    = 0;   // version (4 bits) + IHL (4 bits)
+    constexpr std::size_t TOS        = 1;
+    constexpr std::size_t TOT_LEN    = 2;   // 16-bit
+    constexpr std::size_t ID         = 4;   // 16-bit
+    constexpr std::size_t FRAG_OFF   = 6;   // 16-bit
+    constexpr std::size_t TTL        = 8;
+    constexpr std::size_t PROTOCOL   = 9;
+    constexpr std::size_t CHECKSUM   = 10;  // 16-bit
+    constexpr std::size_t SRC_ADDR   = 12;  // 32-bit
+    constexpr std::size_t DST_ADDR   = 16;  // 32-bit
+    constexpr std::size_t HDR_LEN    = 20;
+}
+
+// TCP header field offsets (RFC 793)
+namespace tcp {
+    constexpr std::size_t SRC_PORT   = 0;   // 16-bit
+    constexpr std::size_t DST_PORT   = 2;   // 16-bit
+    constexpr std::size_t SEQ        = 4;   // 32-bit
+    constexpr std::size_t ACK        = 8;   // 32-bit
+    constexpr std::size_t DATA_OFF   = 12;  // upper 4 bits = data offset
+    constexpr std::size_t FLAGS      = 13;  // 8-bit flags field
+    constexpr std::size_t WINDOW     = 14;  // 16-bit
+    constexpr std::size_t CHECKSUM   = 16;  // 16-bit
+    constexpr std::size_t URG_PTR    = 18;  // 16-bit
+    constexpr std::size_t HDR_LEN    = 20;
+}
+
+// TCP flag bits
+namespace tcp_flags {
+    constexpr uint8_t FIN = 0x01;
+    constexpr uint8_t SYN = 0x02;
+    constexpr uint8_t RST = 0x04;
+    constexpr uint8_t ACK = 0x10;
+}
+
+// ---------------------------------------------------------------------------
 // resolve_source_ip — determine local IP for a given destination
 // ---------------------------------------------------------------------------
 
@@ -106,12 +165,12 @@ std::optional<ProbeReply> parse_reply(std::span<const uint8_t> raw,
                                        std::string_view expected_src_ip) {
     if (raw.size() < 40) return std::nullopt;
 
-    auto version = (raw[0] >> 4) & 0x0F;
+    auto version = (raw[ip::VER_IHL] >> 4) & 0x0F;
     if (version != 4) return std::nullopt;
 
-    auto ihl = static_cast<std::size_t>(raw[0] & 0x0F) * 4u;
+    auto ihl = static_cast<std::size_t>(raw[ip::VER_IHL] & 0x0F) * 4u;
     if (ihl < 20 || raw.size() < ihl + 20) return std::nullopt;
-    if (raw[9] != IPPROTO_TCP) return std::nullopt;
+    if (raw[ip::PROTOCOL] != IPPROTO_TCP) return std::nullopt;
 
     uint32_t expected_addr = 0;
     if (inet_pton(AF_INET, std::string(expected_src_ip).c_str(),
@@ -119,16 +178,16 @@ std::optional<ProbeReply> parse_reply(std::span<const uint8_t> raw,
         return std::nullopt;
     }
     uint32_t pkt_src_addr = 0;
-    std::memcpy(&pkt_src_addr, &raw[12], 4);
+    std::memcpy(&pkt_src_addr, &raw[ip::SRC_ADDR], 4);
     if (pkt_src_addr != expected_addr) return std::nullopt;
 
-    const uint8_t* tcp = raw.data() + ihl;
-    uint16_t src_port = static_cast<uint16_t>(tcp[0] << 8 | tcp[1]);
-    uint8_t flags = tcp[13];
+    const uint8_t* tcp_ptr = raw.data() + ihl;
+    uint16_t src_port = static_cast<uint16_t>(tcp_ptr[0] << 8 | tcp_ptr[1]);
+    uint8_t flags = tcp_ptr[tcp::FLAGS];
 
-    bool syn = (flags & 0x02) != 0;
-    bool ack = (flags & 0x10) != 0;
-    bool rst = (flags & 0x04) != 0;
+    bool syn = (flags & tcp_flags::SYN) != 0;
+    bool ack = (flags & tcp_flags::ACK) != 0;
+    bool rst = (flags & tcp_flags::RST) != 0;
 
     if (syn && ack) return ProbeReply{src_port, true};
     if (rst)        return ProbeReply{src_port, false};
@@ -136,57 +195,69 @@ std::optional<ProbeReply> parse_reply(std::span<const uint8_t> raw,
 }
 
 // ---------------------------------------------------------------------------
-// build_syn_packet
+// build_syn_packet — portable byte-level construction
 // ---------------------------------------------------------------------------
 
 RawPacket build_syn_packet(std::string_view dst_ip, uint16_t dst_port,
                             std::string_view src_ip) {
-    constexpr std::size_t kIpLen  = 20;
-    constexpr std::size_t kTcpLen = 20;
+    constexpr std::size_t kIpLen  = ip::HDR_LEN;
+    constexpr std::size_t kTcpLen = tcp::HDR_LEN;
     constexpr std::size_t kTotal  = kIpLen + kTcpLen;
 
     RawPacket pkt(kTotal, 0);
+    uint8_t* p = pkt.data();
 
-    // -- IPv4 header (struct iphdr from <netinet/ip.h>) --
-    auto* ip = reinterpret_cast<struct iphdr*>(pkt.data());
-    ip->version  = 4;
-    ip->ihl      = 5;
-    ip->tos      = 0;
-    ip->tot_len  = htons(kTotal);
-    ip->id       = htons(rand_u16(1, 65535));
-    ip->frag_off = 0;
-    ip->ttl      = 64;
-    ip->protocol = IPPROTO_TCP;
-    ip->check    = 0;
+    // -- IPv4 header (direct byte writes, no struct overlay) --
+    p[ip::VER_IHL]  = 0x45;               // version=4, ihl=5
+    p[ip::TOS]      = 0;
+    put_u16(p, ip::TOT_LEN, static_cast<uint16_t>(kTotal));
+    put_u16(p, ip::ID, rand_u16(1, 65535));
+    put_u16(p, ip::FRAG_OFF, 0);
+    p[ip::TTL]      = 64;
+    p[ip::PROTOCOL] = IPPROTO_TCP;
+    // checksum field initially zero — computed after all fields are set.
 
-    // Set source address so TCP checksum is computed correctly.
-    // The kernel will NOT fix the TCP checksum when it fills/overwrites saddr.
     uint32_t src_addr = 0;
     if (inet_pton(AF_INET, std::string(src_ip).c_str(), &src_addr) != 1) {
         throw std::runtime_error("invalid source IP: " + std::string(src_ip));
     }
-    ip->saddr = src_addr;
+    std::memcpy(p + ip::SRC_ADDR, &src_addr, 4);
 
     uint32_t dst_addr = 0;
     if (inet_pton(AF_INET, std::string(dst_ip).c_str(), &dst_addr) != 1) {
         throw std::runtime_error("invalid destination IP: " +
                                  std::string(dst_ip));
     }
-    ip->daddr = dst_addr;
-    ip->check = htons(ip_checksum(pkt.data(), kIpLen));
+    std::memcpy(p + ip::DST_ADDR, &dst_addr, 4);
 
-    // -- TCP header (struct tcphdr from <netinet/tcp.h>) --
-    auto* tcp = reinterpret_cast<struct tcphdr*>(pkt.data() + kIpLen);
-    tcp->source  = htons(rand_u16(49152, 65535));
-    tcp->dest    = htons(dst_port);
-    tcp->seq     = htonl(rand_u32());
-    tcp->ack_seq = 0;
-    tcp->doff    = 5;
-    tcp->syn     = 1;
-    tcp->window  = htons(65535);
-    tcp->check   = 0;
-    tcp->urg_ptr = 0;
-    tcp->check   = htons(tcp_checksum(ip->saddr, ip->daddr, tcp, kTcpLen));
+    // IP checksum — stored in network byte order.
+    uint16_t ip_ck = ip_checksum(p, kIpLen);
+    uint16_t ip_ck_net = htons(ip_ck);
+    std::memcpy(p + ip::CHECKSUM, &ip_ck_net, 2);
+
+    // -- TCP header (direct byte writes, no struct overlay) --
+    uint8_t* t = p + kIpLen;
+
+    uint16_t src_port_val = rand_u16(49152, 65535);
+    put_u16(t, tcp::SRC_PORT, src_port_val);
+    put_u16(t, tcp::DST_PORT, dst_port);
+
+    uint32_t seq = rand_u32();
+    uint32_t seq_net = htonl(seq);
+    std::memcpy(t + tcp::SEQ, &seq_net, 4);
+    // ack_seq stays zero
+
+    t[tcp::DATA_OFF] = 0x50;             // data offset = 5 (5 << 4)
+    t[tcp::FLAGS]    = tcp_flags::SYN;    // SYN only
+    put_u16(t, tcp::WINDOW, 65535);
+    // checksum and urg_ptr initially zero
+
+    uint16_t tcp_ck = tcp_checksum(
+        get_u32_net(p, ip::SRC_ADDR),
+        get_u32_net(p, ip::DST_ADDR),
+        t, kTcpLen);
+    uint16_t tcp_ck_net = htons(tcp_ck);
+    std::memcpy(t + tcp::CHECKSUM, &tcp_ck_net, 2);
 
     return pkt;
 }
