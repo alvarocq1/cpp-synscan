@@ -497,7 +497,7 @@ std::vector<ProbeReply> receive_responses(int recv_fd,
             auto* pkt = ptr + bh->bh_hdrlen;
             auto caplen = static_cast<std::size_t>(bh->bh_caplen);
 
-            if (caplen > link_hdr_len + 40) {
+            if (caplen >= link_hdr_len + 40) {
                 auto* ip_data = pkt + link_hdr_len;
                 auto ip_len = caplen - link_hdr_len;
                 auto reply = parse_reply(
