@@ -26,15 +26,23 @@ A personal project for learning low-level networking, raw-socket programming, an
 |---|---|---|---|
 | Build + unit tests | Yes | Yes | No |
 | Raw packet crafting | Yes | Yes | — |
-| Raw socket send (`IPPROTO_RAW`) | Yes | Yes (root) | — |
-| Raw socket receive (`IPPROTO_TCP`) | Yes | Yes (root) | — |
+| Send SYN probes | Yes (`IPPROTO_RAW`) | Yes (`IPPROTO_TCP`, root) | — |
+| Receive responses | Yes (raw socket) | Yes (BPF, root) | — |
 | Source IP resolution (UDP trick) | Yes | Yes | — |
 | Service name lookup (`/etc/services`) | Yes | Yes | — |
 | Capability grant (`setcap`) | Yes | N/A | — |
+| Loopback scanning (`127.0.0.1`) | Yes | Yes | — |
 
-**Linux**: Full support. Grant `CAP_NET_RAW` or run as root.
+**Linux**: Full support. Grant `CAP_NET_RAW` or run as root. Sends via `IPPROTO_RAW` + `IP_HDRINCL`; receives via raw `IPPROTO_TCP` socket.
 
-**macOS**: Full support. Requires root (`sudo`). No capability-based permission model — macOS raw sockets require superuser. Header construction uses portable byte writes (no Linux-specific `struct iphdr`/`struct tcphdr` overlays).
+**macOS**: Full support. Requires root (`sudo`). macOS raw sockets differ from Linux in several ways:
+- `IPPROTO_RAW` silently drops packets on loopback (and often on physical interfaces).
+- `IP_HDRINCL` with any protocol also fails silently on loopback.
+- Raw `IPPROTO_TCP` sockets do not deliver loopback TCP packets.
+
+The macOS backend therefore uses:
+- **Send**: `IPPROTO_TCP` raw socket *without* `IP_HDRINCL` — the kernel builds the IP header; we supply only the TCP segment.
+- **Receive**: BPF (`/dev/bpfN`) bound to the correct interface (`lo0` for loopback, auto-detected for other destinations). This is the same mechanism nmap/libpcap uses on macOS.
 
 **Windows**: Not supported. Raw-socket SYN scanning on Windows requires Npcap or WinPcap, which is a fundamentally different API surface. CMake will fail at configure time with a clear message. Architecture hooks (`platform.h`) are in place for future contributors.
 
@@ -73,8 +81,25 @@ ctest --test-dir build --output-on-failure
 ## Run
 
 ```bash
+# Linux (with CAP_NET_RAW or root)
+sudo ./build/synscan -p 22,53,80,443 127.0.0.1
+
+# macOS (requires root)
 sudo ./build/synscan -p 22,53,80,443 127.0.0.1
 ```
+
+### macOS-specific notes
+
+- Always run with `sudo` — there is no capability-based alternative on macOS.
+- The scanner uses BPF for packet capture, which requires `/dev/bpf*` access (root).
+- Loopback scanning works. The scanner auto-detects the correct interface (`lo0` for `127.0.0.0/8`, the LAN interface for other targets).
+
+### Known limitations
+
+- **Single-target only**: scans one IPv4 address per invocation (no CIDR ranges).
+- **IPv4 only**: no IPv6 support.
+- **No retry logic**: ports that don't respond within the 2-second timeout are marked "filtered".
+- **macOS Ethernet scanning**: the Ethernet BPF filter path is implemented but less tested than loopback. External-host scanning may require firewall configuration.
 
 ---
 
@@ -112,13 +137,13 @@ cpp-synscan/
 
 ### Platform abstraction strategy
 
-Rather than `#ifdef`-branching every socket call, the codebase uses a two-layer approach:
+The codebase uses a three-layer approach:
 
-1. **`platform.h`** — Detects the OS at compile time (`SYNSCAN_LINUX`, `SYNSCAN_MACOS`), includes the correct POSIX headers, and blocks unsupported platforms with `#error`.
+1. **`platform.h`** — Detects the OS at compile time (`SYNSCAN_LINUX`, `SYNSCAN_MACOS`), includes the correct POSIX and platform-specific headers (BPF on macOS), and blocks unsupported platforms with `#error`.
 
 2. **Portable byte writes** — `build_syn_packet()` and `parse_reply()` operate on raw byte arrays at RFC-defined offsets instead of overlaying platform-specific structs (`struct iphdr` on Linux vs `struct ip` on BSD). This eliminates the most common source of Linux/macOS incompatibility in raw-socket code.
 
-The POSIX socket API (`socket()`, `sendto()`, `recv()`, `poll()`, `connect()`, `getsockname()`) is identical on both platforms.
+3. **Platform-specific I/O** — `send_packet()`, `open_receiver()`, and `receive_responses()` use `#ifdef SYNSCAN_MACOS` to select the correct send/receive mechanism. Linux uses raw sockets; macOS uses raw TCP sockets (send) and BPF (receive).
 
 ### Future: Windows support
 
