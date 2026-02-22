@@ -49,7 +49,7 @@ std::vector<PortResult> run_scan(const ScanConfig& config) {
     // Open the receiver socket BEFORE sending any probes.
     // On localhost, responses arrive in microseconds — if we open the
     // socket after sending, we miss them and every port looks "filtered".
-    int recv_fd = open_receiver();
+    int recv_fd = open_receiver(ip);
     if (recv_fd < 0) {
         throw std::runtime_error(
             "cannot open raw receive socket — "

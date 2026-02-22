@@ -77,12 +77,14 @@ struct ProbeReply {
 [[nodiscard]] bool send_packet(const RawPacket& packet,
                                 std::string_view dst_ip);
 
-/// Open a raw socket for receiving TCP packets.
+/// Open a receiver for capturing TCP packets.
+/// On Linux: a raw socket (AF_INET, SOCK_RAW, IPPROTO_TCP).
+/// On macOS: a BPF device bound to the interface for `dst_ip`.
 /// Must be called BEFORE sending probes to avoid missing fast replies.
 /// Returns the file descriptor, or -1 on failure.
-[[nodiscard]] int open_receiver();
+[[nodiscard]] int open_receiver(std::string_view dst_ip);
 
-/// Read TCP replies from an already-open receiver socket for up to
+/// Read TCP replies from an already-open receiver fd for up to
 /// `timeout_ms` milliseconds.  `expected_src_ip` filters by source.
 /// The caller is responsible for closing `recv_fd` afterward.
 [[nodiscard]] std::vector<ProbeReply> receive_responses(

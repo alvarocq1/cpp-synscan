@@ -267,6 +267,36 @@ RawPacket build_syn_packet(std::string_view dst_ip, uint16_t dst_port,
 // ---------------------------------------------------------------------------
 
 bool send_packet(const RawPacket& packet, std::string_view dst_ip) {
+#ifdef SYNSCAN_MACOS
+    // macOS: both IPPROTO_RAW and IPPROTO_TCP+IP_HDRINCL silently drop
+    // packets on the loopback interface.  The only reliable approach is
+    // IPPROTO_TCP *without* IP_HDRINCL — the kernel builds the IP header
+    // and we supply only the TCP segment.
+    //
+    // build_syn_packet() produces a full 40-byte IP+TCP packet.  We send
+    // only the TCP portion (bytes 20..39).
+    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
+    if (fd < 0) return false;
+
+    // Extract the TCP header (skip the 20-byte IP header).
+    if (packet.size() < ip::HDR_LEN + tcp::HDR_LEN) {
+        close(fd);
+        return false;
+    }
+    const uint8_t* tcp_data = packet.data() + ip::HDR_LEN;
+    std::size_t tcp_len = packet.size() - ip::HDR_LEN;
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    inet_pton(AF_INET, std::string(dst_ip).c_str(), &addr.sin_addr);
+
+    auto sent = sendto(fd, tcp_data, tcp_len, 0,
+                       reinterpret_cast<struct sockaddr*>(&addr),
+                       sizeof(addr));
+    close(fd);
+    return sent >= 0;
+#else
+    // Linux: IPPROTO_RAW + IP_HDRINCL works as expected.
     int fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (fd < 0) return false;
 
@@ -285,18 +315,130 @@ bool send_packet(const RawPacket& packet, std::string_view dst_ip) {
                        sizeof(addr));
     close(fd);
     return sent >= 0;
+#endif
 }
 
 // ---------------------------------------------------------------------------
-// open_receiver — create a raw socket for capturing TCP replies
+// open_receiver — platform-specific packet capture
 // ---------------------------------------------------------------------------
 
-int open_receiver() {
+#ifdef SYNSCAN_MACOS
+
+/// Determine the network interface used to reach `dst_ip`.
+/// For 127.0.0.0/8 returns "lo0"; otherwise uses a connected UDP socket
+/// and getifaddrs to match the source IP to an interface name.
+static std::string resolve_interface(std::string_view dst_ip) {
+    // Loopback shortcut
+    if (dst_ip.starts_with("127.")) return "lo0";
+
+    // Determine which source IP the OS would use
+    std::string src = resolve_source_ip(dst_ip);
+
+    uint32_t src_addr = 0;
+    inet_pton(AF_INET, src.c_str(), &src_addr);
+
+    // Walk interface addresses to find the matching interface
+    struct ifaddrs* ifa_list = nullptr;
+    if (getifaddrs(&ifa_list) < 0) return "lo0";
+
+    std::string result = "lo0";
+    for (auto* ifa = ifa_list; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == nullptr) continue;
+        if (ifa->ifa_addr->sa_family != AF_INET) continue;
+        auto* sa = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
+        if (sa->sin_addr.s_addr == src_addr) {
+            result = ifa->ifa_name;
+            break;
+        }
+    }
+    freeifaddrs(ifa_list);
+    return result;
+}
+
+int open_receiver(std::string_view dst_ip) {
+    std::string iface = resolve_interface(dst_ip);
+
+    // Find an available BPF device
+    int fd = -1;
+    for (int i = 0; i < 128; ++i) {
+        std::string dev = "/dev/bpf" + std::to_string(i);
+        fd = open(dev.c_str(), O_RDWR);
+        if (fd >= 0) break;
+    }
+    if (fd < 0) return -1;
+
+    // Set buffer size
+    int bufsize = 524288;
+    ioctl(fd, BIOCSBLEN, &bufsize);
+
+    // Bind to interface
+    struct ifreq ifr{};
+    std::strncpy(ifr.ifr_name, iface.c_str(), IFNAMSIZ - 1);
+    if (ioctl(fd, BIOCSETIF, &ifr) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    // Immediate mode — deliver packets as soon as they arrive
+    int imm = 1;
+    ioctl(fd, BIOCIMMEDIATE, &imm);
+
+    // Promiscuous mode (needed for loopback capture)
+    ioctl(fd, BIOCPROMISC, nullptr);
+
+    // BPF filter: accept only TCP (IPv4, protocol 6)
+    // Loopback link header is 4 bytes (AF family in host byte order).
+    // We skip the AF check (endianness-dependent) and verify IPv4 by
+    // masking the version nibble of the IP header at offset 4.
+    struct bpf_insn filter[] = {
+        BPF_STMT(BPF_LD + BPF_B + BPF_ABS, 4),           // ver_ihl byte
+        BPF_STMT(BPF_ALU + BPF_AND + BPF_K, 0xF0),       // mask version nibble
+        BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, 0x40, 0, 3), // version == 4?
+        BPF_STMT(BPF_LD + BPF_B + BPF_ABS, 4 + 9),       // ip.protocol
+        BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, IPPROTO_TCP, 0, 1),
+        BPF_STMT(BPF_RET + BPF_K, 65536),                 // accept
+        BPF_STMT(BPF_RET + BPF_K, 0),                     // reject
+    };
+    // For Ethernet interfaces, the link header is 14 bytes.
+    // Adjust offsets if not loopback.
+    struct bpf_insn filter_eth[] = {
+        BPF_STMT(BPF_LD + BPF_H + BPF_ABS, 12),          // ethertype
+        BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, 0x0800, 0, 3), // must be IPv4
+        BPF_STMT(BPF_LD + BPF_B + BPF_ABS, 14 + 9),      // ip.protocol
+        BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, IPPROTO_TCP, 0, 1),
+        BPF_STMT(BPF_RET + BPF_K, 65536),                 // accept
+        BPF_STMT(BPF_RET + BPF_K, 0),                     // reject
+    };
+
+    // Determine link type to choose the right filter
+    uint32_t dlt = 0;
+    ioctl(fd, BIOCGDLT, &dlt);
+
+    struct bpf_program prog{};
+    if (dlt == DLT_NULL) {
+        // Loopback (BSD NULL encapsulation)
+        prog.bf_len = sizeof(filter) / sizeof(filter[0]);
+        prog.bf_insns = filter;
+    } else {
+        // Ethernet
+        prog.bf_len = sizeof(filter_eth) / sizeof(filter_eth[0]);
+        prog.bf_insns = filter_eth;
+    }
+    ioctl(fd, BIOCSETF, &prog);
+
+    return fd;
+}
+
+#else // Linux
+
+int open_receiver([[maybe_unused]] std::string_view dst_ip) {
     return socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
 }
 
+#endif
+
 // ---------------------------------------------------------------------------
-// receive_responses — read from an already-open receiver socket
+// receive_responses — read from an already-open receiver fd
 // ---------------------------------------------------------------------------
 
 std::vector<ProbeReply> receive_responses(int recv_fd,
@@ -305,7 +447,6 @@ std::vector<ProbeReply> receive_responses(int recv_fd,
     if (recv_fd < 0) return {};
 
     std::vector<ProbeReply> replies;
-    uint8_t buf[65536];
 
     struct timespec start{};
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -317,6 +458,62 @@ std::vector<ProbeReply> receive_responses(int recv_fd,
             (now.tv_sec - start.tv_sec) * 1000 +
             (now.tv_nsec - start.tv_nsec) / 1'000'000);
     };
+
+#ifdef SYNSCAN_MACOS
+    // macOS: read BPF frames.  Each read may return multiple packets,
+    // each prefixed by a bpf_hdr.  The IP packet follows the link-layer
+    // header (4 bytes for loopback NULL, 14 for Ethernet).
+
+    // Determine link header length from the BPF fd.
+    uint32_t dlt = 0;
+    ioctl(recv_fd, BIOCGDLT, &dlt);
+    std::size_t link_hdr_len = (dlt == DLT_NULL) ? 4 : 14;
+
+    int blen = 0;
+    ioctl(recv_fd, BIOCGBLEN, &blen);
+    if (blen <= 0) blen = 524288;
+
+    std::vector<uint8_t> buf(static_cast<std::size_t>(blen));
+
+    while (true) {
+        int remaining = timeout_ms - elapsed_ms();
+        if (remaining <= 0) break;
+
+        struct pollfd pfd{};
+        pfd.fd     = recv_fd;
+        pfd.events = POLLIN;
+
+        int ret = poll(&pfd, 1, remaining);
+        if (ret <= 0) break;
+
+        auto n = read(recv_fd, buf.data(), buf.size());
+        if (n <= 0) continue;
+
+        // Walk the BPF buffer — it may contain multiple packets.
+        auto* ptr = buf.data();
+        auto* end = buf.data() + n;
+        while (ptr < end) {
+            auto* bh = reinterpret_cast<struct bpf_hdr*>(ptr);
+            auto* pkt = ptr + bh->bh_hdrlen;
+            auto caplen = static_cast<std::size_t>(bh->bh_caplen);
+
+            if (caplen > link_hdr_len + 40) {
+                auto* ip_data = pkt + link_hdr_len;
+                auto ip_len = caplen - link_hdr_len;
+                auto reply = parse_reply(
+                    std::span<const uint8_t>(ip_data, ip_len),
+                    expected_src_ip);
+                if (reply) {
+                    replies.push_back(*reply);
+                }
+            }
+
+            ptr += BPF_WORDALIGN(bh->bh_hdrlen + bh->bh_caplen);
+        }
+    }
+#else
+    // Linux: read raw IP packets from the IPPROTO_TCP socket.
+    uint8_t buf[65536];
 
     while (true) {
         int remaining = timeout_ms - elapsed_ms();
@@ -339,6 +536,7 @@ std::vector<ProbeReply> receive_responses(int recv_fd,
             replies.push_back(*reply);
         }
     }
+#endif
 
     return replies;
 }

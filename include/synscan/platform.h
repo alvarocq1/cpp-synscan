@@ -62,7 +62,13 @@
 #ifdef SYNSCAN_MACOS
 #   include <netinet/ip.h>
 #   include <netinet/tcp.h>
-//  macOS note: the kernel byte-swaps ip_len and ip_off in received raw
-//  packets (but not when sending with IP_HDRINCL set on newer macOS).
-//  Our code writes header bytes directly, so this is handled naturally.
+#   include <net/bpf.h>
+#   include <net/if.h>
+#   include <sys/ioctl.h>
+#   include <fcntl.h>
+#   include <ifaddrs.h>
+//  macOS note: IPPROTO_RAW does not transmit packets on the loopback
+//  interface.  We use IPPROTO_TCP + IP_HDRINCL for sending and BPF
+//  (Berkeley Packet Filter) for receiving — the same approach nmap/libpcap
+//  uses on macOS.
 #endif
