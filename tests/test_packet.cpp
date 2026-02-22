@@ -37,7 +37,7 @@ static constexpr std::size_t OFF_IP_HDR_LEN  = 20;
 // TCP offsets (relative to TCP header start)
 static constexpr std::size_t TCP_SRC_PORT = 0;
 static constexpr std::size_t TCP_DST_PORT = 2;
-static constexpr std::size_t TCP_DATA_OFF = 12;
+[[maybe_unused]] static constexpr std::size_t TCP_DATA_OFF = 12;
 static constexpr std::size_t TCP_FLAGS    = 13;
 
 // TCP flag bits

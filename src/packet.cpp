@@ -69,9 +69,9 @@ static inline void put_u16(uint8_t* buf, std::size_t offset, uint16_t val) {
 }
 
 /// Write a 32-bit value in network byte order at `buf + offset`.
+[[maybe_unused]]
 static inline void put_u32(uint8_t* buf, std::size_t offset, uint32_t val) {
     uint32_t n = htonl(val);
-    std::memcpy(buf + offset, &n, 2);  // only used for seq/ack
     std::memcpy(buf + offset, &n, 4);
 }
 
@@ -102,18 +102,18 @@ namespace tcp {
     constexpr std::size_t SRC_PORT   = 0;   // 16-bit
     constexpr std::size_t DST_PORT   = 2;   // 16-bit
     constexpr std::size_t SEQ        = 4;   // 32-bit
-    constexpr std::size_t ACK        = 8;   // 32-bit
+    [[maybe_unused]] constexpr std::size_t ACK = 8;  // 32-bit
     constexpr std::size_t DATA_OFF   = 12;  // upper 4 bits = data offset
     constexpr std::size_t FLAGS      = 13;  // 8-bit flags field
     constexpr std::size_t WINDOW     = 14;  // 16-bit
     constexpr std::size_t CHECKSUM   = 16;  // 16-bit
-    constexpr std::size_t URG_PTR    = 18;  // 16-bit
+    [[maybe_unused]] constexpr std::size_t URG_PTR = 18; // 16-bit
     constexpr std::size_t HDR_LEN    = 20;
 }
 
 // TCP flag bits
 namespace tcp_flags {
-    constexpr uint8_t FIN = 0x01;
+    [[maybe_unused]] constexpr uint8_t FIN = 0x01;
     constexpr uint8_t SYN = 0x02;
     constexpr uint8_t RST = 0x04;
     constexpr uint8_t ACK = 0x10;
