@@ -11,3 +11,11 @@ add_test(NAME args COMMAND test_args)
 add_executable(test_output test_output.cpp)
 target_link_libraries(test_output PRIVATE synscan_lib)
 add_test(NAME output COMMAND test_output)
+
+add_executable(test_packet test_packet.cpp)
+target_link_libraries(test_packet PRIVATE synscan_lib)
+add_test(NAME packet COMMAND test_packet)
+
+add_executable(test_scanner test_scanner.cpp)
+target_link_libraries(test_scanner PRIVATE synscan_lib)
+add_test(NAME scanner COMMAND test_scanner)

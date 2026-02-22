@@ -19,8 +19,7 @@ inline int g_test_failures = 0;
         auto _b = (b);                                                       \
         if (_a != _b) {                                                      \
             std::cerr << __FILE__ << ":" << __LINE__ << ": FAIL: "           \
-                      << #a << " == " << #b << "  (" << _a << " != " << _b  \
-                      << ")\n";                                              \
+                      << #a << " == " << #b << "\n";                         \
             ++g_test_failures;                                               \
         }                                                                    \
     } while (false)
