@@ -42,9 +42,10 @@ static uint32_t rand_u32() {
 }
 
 /// TCP checksum including IPv4 pseudo-header (RFC 793 section 3.1).
+/// Uses a stack buffer to avoid heap allocation (tcp_len is always 20).
 static uint16_t tcp_checksum(uint32_t src_addr, uint32_t dst_addr,
                               const void* tcp_hdr, std::size_t tcp_len) {
-    std::vector<uint8_t> buf(12 + tcp_len, 0);
+    uint8_t buf[12 + 60]; // 12-byte pseudo-header + max TCP header
     std::memcpy(&buf[0], &src_addr, 4);
     std::memcpy(&buf[4], &dst_addr, 4);
     buf[8] = 0;
@@ -52,7 +53,7 @@ static uint16_t tcp_checksum(uint32_t src_addr, uint32_t dst_addr,
     uint16_t tlen = htons(static_cast<uint16_t>(tcp_len));
     std::memcpy(&buf[10], &tlen, 2);
     std::memcpy(&buf[12], tcp_hdr, tcp_len);
-    return ip_checksum(buf.data(), buf.size());
+    return ip_checksum(buf, 12 + tcp_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +271,53 @@ RawPacket build_syn_packet(std::string_view dst_ip, uint16_t dst_port,
 }
 
 // ---------------------------------------------------------------------------
+// build_syn_packet_fast — zero-alloc hot-path variant
+// ---------------------------------------------------------------------------
+
+std::size_t build_syn_packet_fast(uint8_t* p,
+                                   uint32_t src_addr, uint32_t dst_addr,
+                                   uint16_t dst_port) {
+    constexpr std::size_t kIpLen  = ip::HDR_LEN;
+    constexpr std::size_t kTcpLen = tcp::HDR_LEN;
+    constexpr std::size_t kTotal  = kIpLen + kTcpLen;
+
+    std::memset(p, 0, kTotal);
+
+    // -- IPv4 header --
+    p[ip::VER_IHL]  = 0x45;
+    put_u16(p, ip::TOT_LEN, static_cast<uint16_t>(kTotal));
+    put_u16(p, ip::ID, rand_u16(1, 65535));
+    p[ip::TTL]      = 64;
+    p[ip::PROTOCOL] = IPPROTO_TCP;
+
+    std::memcpy(p + ip::SRC_ADDR, &src_addr, 4);
+    std::memcpy(p + ip::DST_ADDR, &dst_addr, 4);
+
+    uint16_t ip_ck = ip_checksum(p, kIpLen);
+    uint16_t ip_ck_net = htons(ip_ck);
+    std::memcpy(p + ip::CHECKSUM, &ip_ck_net, 2);
+
+    // -- TCP header --
+    uint8_t* t = p + kIpLen;
+
+    put_u16(t, tcp::SRC_PORT, rand_u16(49152, 65535));
+    put_u16(t, tcp::DST_PORT, dst_port);
+
+    uint32_t seq_net = htonl(rand_u32());
+    std::memcpy(t + tcp::SEQ, &seq_net, 4);
+
+    t[tcp::DATA_OFF] = 0x50;
+    t[tcp::FLAGS]    = tcp_flags::SYN;
+    put_u16(t, tcp::WINDOW, 65535);
+
+    uint16_t tcp_ck = tcp_checksum(src_addr, dst_addr, t, kTcpLen);
+    uint16_t tcp_ck_net = htons(tcp_ck);
+    std::memcpy(t + tcp::CHECKSUM, &tcp_ck_net, 2);
+
+    return kTotal;
+}
+
+// ---------------------------------------------------------------------------
 // send_packet — requires CAP_NET_RAW or root
 // ---------------------------------------------------------------------------
 
@@ -308,6 +356,23 @@ bool send_on_socket(int send_fd, const RawPacket& packet,
 #else
     auto sent = sendto(send_fd, packet.data(), packet.size(), 0,
                        reinterpret_cast<struct sockaddr*>(&addr),
+                       sizeof(addr));
+#endif
+    return sent >= 0;
+}
+
+bool send_on_socket(int send_fd, const uint8_t* data, std::size_t len,
+                      const struct sockaddr_in& addr) {
+#ifdef SYNSCAN_MACOS
+    if (len < ip::HDR_LEN + tcp::HDR_LEN) return false;
+    const uint8_t* tcp_data = data + ip::HDR_LEN;
+    std::size_t tcp_len = len - ip::HDR_LEN;
+    auto sent = sendto(send_fd, tcp_data, tcp_len, 0,
+                       reinterpret_cast<const struct sockaddr*>(&addr),
+                       sizeof(addr));
+#else
+    auto sent = sendto(send_fd, data, len, 0,
+                       reinterpret_cast<const struct sockaddr*>(&addr),
                        sizeof(addr));
 #endif
     return sent >= 0;
@@ -577,6 +642,103 @@ std::vector<ProbeReply> receive_responses(int recv_fd,
             auto reply = parse_reply(
                 std::span<const uint8_t>(buf, static_cast<std::size_t>(n)),
                 expected_src_ip);
+            if (reply) {
+                replies.push_back(*reply);
+            }
+        }
+    }
+#endif
+
+    return replies;
+}
+
+std::vector<ProbeReply> receive_responses(int recv_fd,
+                                           uint32_t expected_src_addr,
+                                           int timeout_ms) {
+    if (recv_fd < 0) return {};
+
+    std::vector<ProbeReply> replies;
+
+    struct timespec start{};
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    auto elapsed_ms = [&]() -> int {
+        struct timespec now{};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        return static_cast<int>(
+            (now.tv_sec - start.tv_sec) * 1000 +
+            (now.tv_nsec - start.tv_nsec) / 1'000'000);
+    };
+
+#ifdef SYNSCAN_MACOS
+    // macOS: read BPF frames (same logic as string_view overload).
+    uint32_t dlt = 0;
+    ioctl(recv_fd, BIOCGDLT, &dlt);
+    std::size_t link_hdr_len = (dlt == DLT_NULL) ? 4 : 14;
+
+    int blen = 0;
+    ioctl(recv_fd, BIOCGBLEN, &blen);
+    if (blen <= 0) blen = 524288;
+
+    std::vector<uint8_t> buf(static_cast<std::size_t>(blen));
+
+    while (true) {
+        int remaining = timeout_ms - elapsed_ms();
+        if (remaining <= 0) break;
+
+        struct pollfd pfd{};
+        pfd.fd     = recv_fd;
+        pfd.events = POLLIN;
+
+        int ret = poll(&pfd, 1, remaining);
+        if (ret <= 0) break;
+
+        auto n = read(recv_fd, buf.data(), buf.size());
+        if (n <= 0) continue;
+
+        auto* ptr = buf.data();
+        auto* end = buf.data() + n;
+        while (ptr < end) {
+            auto* bh = reinterpret_cast<struct bpf_hdr*>(ptr);
+            auto* pkt = ptr + bh->bh_hdrlen;
+            auto caplen = static_cast<std::size_t>(bh->bh_caplen);
+
+            if (caplen >= link_hdr_len + 40) {
+                auto* ip_data = pkt + link_hdr_len;
+                auto ip_len = caplen - link_hdr_len;
+                auto reply = parse_reply(
+                    std::span<const uint8_t>(ip_data, ip_len),
+                    expected_src_addr);
+                if (reply) {
+                    replies.push_back(*reply);
+                }
+            }
+
+            ptr += BPF_WORDALIGN(bh->bh_hdrlen + bh->bh_caplen);
+        }
+    }
+#else
+    uint8_t buf[65536];
+
+    while (true) {
+        int remaining = timeout_ms - elapsed_ms();
+        if (remaining <= 0) break;
+
+        struct pollfd pfd{};
+        pfd.fd     = recv_fd;
+        pfd.events = POLLIN;
+
+        int ret = poll(&pfd, 1, remaining);
+        if (ret <= 0) break;
+
+        for (;;) {
+            auto n = recv(recv_fd, buf, sizeof(buf), MSG_DONTWAIT);
+            if (n < 0) break;
+            if (n < 40) continue;
+
+            auto reply = parse_reply(
+                std::span<const uint8_t>(buf, static_cast<std::size_t>(n)),
+                expected_src_addr);
             if (reply) {
                 replies.push_back(*reply);
             }

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <ctime>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -35,10 +36,27 @@ static std::string resolve_target(const std::string& target) {
     return ip_str;
 }
 
-/// Look up /etc/services for a well-known service name.
-static std::string lookup_service(uint16_t port) {
-    auto* ent = getservbyport(htons(port), "tcp");
-    return ent ? ent->s_name : "";
+/// Look up /etc/services for a well-known service name (cached).
+static const std::string& lookup_service(uint16_t port) {
+    // Build the cache once on first call.  65536 entries × small string
+    // is cheap and avoids getservbyport() per port in the results loop.
+    static const auto cache = []() {
+        std::unordered_map<uint16_t, std::string> m;
+        m.reserve(1024);
+        struct servent* ent;
+        setservent(0);
+        while ((ent = getservent()) != nullptr) {
+            if (std::strcmp(ent->s_proto, "tcp") == 0) {
+                uint16_t p = ntohs(static_cast<uint16_t>(ent->s_port));
+                m.emplace(p, ent->s_name);
+            }
+        }
+        endservent();
+        return m;
+    }();
+    static const std::string empty;
+    auto it = cache.find(port);
+    return it != cache.end() ? it->second : empty;
 }
 
 std::vector<PortResult> run_scan(const ScanConfig& config) {
@@ -47,14 +65,21 @@ std::vector<PortResult> run_scan(const ScanConfig& config) {
     // Determine the source IP the OS would use for this destination.
     std::string src_ip = resolve_source_ip(ip);
 
-    // Pre-parse the expected source address to avoid per-packet inet_pton()
-    // in the hot drain loop (~65K calls for a full-range scan).
+    // Pre-parse addresses ONCE to avoid inet_pton() in hot loops.
     uint32_t expected_addr = 0;
     inet_pton(AF_INET, ip.c_str(), &expected_addr);
 
+    uint32_t src_addr = 0;
+    inet_pton(AF_INET, src_ip.c_str(), &src_addr);
+
+    uint32_t dst_addr = expected_addr;
+
+    // Pre-build the destination sockaddr_in once.
+    struct sockaddr_in dst_sockaddr{};
+    dst_sockaddr.sin_family = AF_INET;
+    dst_sockaddr.sin_addr.s_addr = dst_addr;
+
     // Open the receiver socket BEFORE sending any probes.
-    // On localhost, responses arrive in microseconds — if we open the
-    // socket after sending, we miss them and every port looks "filtered".
     int recv_fd = open_receiver(ip);
     if (recv_fd < 0) {
         throw std::runtime_error(
@@ -73,9 +98,9 @@ std::vector<PortResult> run_scan(const ScanConfig& config) {
 
     // Classify replies into a state map as they arrive.
     std::unordered_map<uint16_t, PortState> state_map;
+    state_map.reserve(config.ports.size());
 
     // Helper: drain all currently-available packets without blocking.
-    // Uses pre-parsed address to avoid inet_pton() per packet.
     auto drain_replies = [&]() {
         uint8_t buf[65536];
         for (;;) {
@@ -94,13 +119,12 @@ std::vector<PortResult> run_scan(const ScanConfig& config) {
 
     std::mt19937 rng{std::random_device{}()};
 
-    // Retry loop: on localhost, the kernel's network backlog queue can
-    // overflow when we blast 65K+ SYN packets at full speed, causing
-    // responses to be silently dropped.  Re-probing "filtered" ports
-    // recovers these losses reliably.
+    // Stack-allocated packet buffer — no heap alloc per packet.
+    uint8_t pkt_buf[40];
+
     constexpr int kMaxRetries = 2;
-    constexpr std::size_t kBatchSize = 256;
-    constexpr int kBatchPauseUs = 100; // microseconds between batches
+    constexpr std::size_t kBatchSize = 512;
+    constexpr int kBatchPauseUs = 50; // microseconds between batches
 
     std::vector<uint16_t> pending = config.ports;
 
@@ -109,14 +133,14 @@ std::vector<PortResult> run_scan(const ScanConfig& config) {
         // Randomise scan order each round.
         std::shuffle(pending.begin(), pending.end(), rng);
 
-        // Send SYN probes in small batches, draining the receive buffer
-        // and yielding briefly between batches so the kernel's softirq
-        // can process loopback responses before the backlog overflows.
+        // Send SYN probes in batches, draining the receive buffer
+        // between batches so the kernel's backlog doesn't overflow.
         for (std::size_t i = 0; i < pending.size(); i += kBatchSize) {
             std::size_t end = std::min(i + kBatchSize, pending.size());
             for (std::size_t j = i; j < end; ++j) {
-                auto pkt = build_syn_packet(ip, pending[j], src_ip);
-                if (!send_on_socket(send_fd, pkt, ip)) {
+                auto len = build_syn_packet_fast(pkt_buf, src_addr,
+                                                  dst_addr, pending[j]);
+                if (!send_on_socket(send_fd, pkt_buf, len, dst_sockaddr)) {
                     close(send_fd);
                     close(recv_fd);
                     throw std::runtime_error(
@@ -130,14 +154,47 @@ std::vector<PortResult> run_scan(const ScanConfig& config) {
             }
         }
 
-        // Timed receive to catch stragglers.  Use a shorter timeout for
-        // intermediate rounds; the final round gets the full timeout so
-        // remote (non-localhost) hosts with real latency are handled.
-        int timeout = (attempt < kMaxRetries) ? 500 : 2000;
-        auto replies = receive_responses(recv_fd, ip, timeout);
-        for (const auto& r : replies) {
-            state_map[r.source_port] =
-                r.is_syn_ack ? PortState::Open : PortState::Closed;
+        // Adaptive timed receive: use shorter initial poll, then extend
+        // only if we're still receiving replies.  On localhost most
+        // replies arrive within a few ms; we don't need to wait 500ms.
+        int max_timeout = (attempt < kMaxRetries) ? 500 : 2000;
+        int poll_step = 50; // check in 50ms increments
+        // Be more patient on final attempt to catch late stragglers.
+        int max_idle = (attempt < kMaxRetries) ? 3 : 6;
+
+        struct timespec t_start{};
+        clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+        auto time_elapsed = [&]() -> int {
+            struct timespec now{};
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            return static_cast<int>(
+                (now.tv_sec - t_start.tv_sec) * 1000 +
+                (now.tv_nsec - t_start.tv_nsec) / 1'000'000);
+        };
+
+        std::size_t prev_count = state_map.size();
+        int idle_polls = 0;
+
+        while (time_elapsed() < max_timeout) {
+            int remaining = max_timeout - time_elapsed();
+            int this_timeout = std::min(poll_step, remaining);
+            if (this_timeout <= 0) break;
+
+            auto batch = receive_responses(recv_fd, expected_addr,
+                                           this_timeout);
+            for (const auto& r : batch) {
+                state_map[r.source_port] =
+                    r.is_syn_ack ? PortState::Open : PortState::Closed;
+            }
+
+            if (state_map.size() == prev_count) {
+                ++idle_polls;
+                if (idle_polls >= max_idle) break;
+            } else {
+                idle_polls = 0;
+                prev_count = state_map.size();
+            }
         }
 
         // Collect ports that still have no response (filtered).
@@ -146,6 +203,31 @@ std::vector<PortResult> run_scan(const ScanConfig& config) {
             if (state_map.find(port) == state_map.end()) {
                 pending.push_back(port);
             }
+        }
+    }
+
+    // Final sweep: if ports remain unresolved after all retries, resend
+    // probes one-at-a-time with immediate draining.  This eliminates
+    // buffer pressure entirely and reliably recovers ports whose RST
+    // responses were dropped from the kernel receive queue during the
+    // initial high-speed burst.  Only runs for the (small) set of
+    // remaining ports, so the overhead is negligible.
+    if (state_map.size() < config.ports.size()) {
+        for (uint16_t port : config.ports) {
+            if (state_map.find(port) != state_map.end()) continue;
+            auto len = build_syn_packet_fast(pkt_buf, src_addr,
+                                              dst_addr, port);
+            if (send_on_socket(send_fd, pkt_buf, len, dst_sockaddr)) {
+                drain_replies();
+            }
+        }
+        // Brief patient wait for the last batch of responses.
+        struct pollfd pfd{};
+        pfd.fd     = recv_fd;
+        pfd.events = POLLIN;
+        for (int i = 0; i < 6; ++i) {        // up to 6 × 50 ms = 300 ms
+            if (poll(&pfd, 1, 50) <= 0) break;
+            drain_replies();
         }
     }
 

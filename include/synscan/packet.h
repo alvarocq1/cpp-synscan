@@ -28,6 +28,7 @@
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
+#include <netinet/in.h>
 #include <optional>
 #include <span>
 #include <string>
@@ -78,6 +79,14 @@ struct ProbeReply {
                                          uint16_t dst_port,
                                          std::string_view src_ip);
 
+/// Fast overload: build a SYN packet into a caller-supplied buffer using
+/// pre-parsed network-order addresses.  Avoids heap allocation and
+/// inet_pton() per packet (critical for 65K-port scans).
+/// `buf` must point to at least 40 bytes.  Returns 40 (packet size).
+std::size_t build_syn_packet_fast(uint8_t* buf,
+                                   uint32_t src_addr, uint32_t dst_addr,
+                                   uint16_t dst_port);
+
 /// Open a raw socket suitable for sending SYN packets.
 /// On Linux: IPPROTO_RAW + IP_HDRINCL.
 /// On macOS: IPPROTO_TCP (kernel builds IP header for loopback).
@@ -88,6 +97,12 @@ struct ProbeReply {
 /// Returns true on success.
 [[nodiscard]] bool send_on_socket(int send_fd, const RawPacket& packet,
                                    std::string_view dst_ip);
+
+/// Fast overload: send using a pre-built sockaddr_in (avoids inet_pton
+/// per packet).
+[[nodiscard]] bool send_on_socket(int send_fd, const uint8_t* data,
+                                   std::size_t len,
+                                   const ::sockaddr_in& addr);
 
 /// Open a receiver for capturing TCP packets.
 /// On Linux: a raw socket (AF_INET, SOCK_RAW, IPPROTO_TCP).
@@ -102,6 +117,12 @@ struct ProbeReply {
 [[nodiscard]] std::vector<ProbeReply> receive_responses(
     int recv_fd,
     std::string_view expected_src_ip,
+    int timeout_ms);
+
+/// Fast overload: takes pre-parsed address to avoid inet_pton per packet.
+[[nodiscard]] std::vector<ProbeReply> receive_responses(
+    int recv_fd,
+    uint32_t expected_src_addr,
     int timeout_ms);
 
 } // namespace synscan
