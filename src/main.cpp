@@ -2,6 +2,7 @@
 #include "synscan/output.h"
 #include "synscan/scanner.h"
 
+#include <chrono>
 #include <fstream>
 #include <iostream>
 
@@ -18,7 +19,10 @@ int main(int argc, char* argv[]) {
                       << " port(s)\n";
         }
 
+        auto t_start = std::chrono::steady_clock::now();
         auto results = synscan::run_scan(*config);
+        auto t_end = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(t_end - t_start).count();
 
         // Direct output to file or stdout.
         if (config->output_file) {
@@ -28,9 +32,9 @@ int main(int argc, char* argv[]) {
                           << *config->output_file << "\n";
                 return 1;
             }
-            synscan::print_results(ofs, results);
+            synscan::print_results(ofs, results, elapsed);
         } else {
-            synscan::print_results(std::cout, results);
+            synscan::print_results(std::cout, results, elapsed);
         }
 
         return 0;

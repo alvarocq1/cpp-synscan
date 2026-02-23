@@ -14,7 +14,7 @@ void print_usage(const char* program_name) {
         << " -p <port-spec> [-o <file>] [-v] <target>\n"
         << "\n"
         << "Options:\n"
-        << "  -p <ports>   Port specification (e.g. 22,80,443 or 1-1024)\n"
+        << "  -p <ports>   Port specification (e.g. 22,80,443 or 1-1024 or -p- for all)\n"
         << "  -o <file>    Write output to file (default: stdout)\n"
         << "  -v           Verbose output\n"
         << "  -h, --help   Show this help message\n"
@@ -45,6 +45,13 @@ std::optional<ScanConfig> parse_args(int argc, char* argv[]) {
                 throw std::runtime_error("-p requires a port specification");
             }
             config.ports = parse_port_spec(argv[i]);
+            got_ports = true;
+            continue;
+        }
+
+        // Handle combined form: -p<spec> (e.g. -p- or -p80 or -p22,80,443)
+        if (arg.substr(0, 2) == "-p" && arg.size() > 2) {
+            config.ports = parse_port_spec(arg.substr(2));
             got_ports = true;
             continue;
         }

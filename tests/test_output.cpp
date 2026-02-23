@@ -21,7 +21,7 @@ int main() {
             {443, PortState::Closed, "https"},
         };
         std::ostringstream oss;
-        print_results(oss, results);
+        print_results(oss, results, 1.23);
         std::string output = oss.str();
 
         // Verify header is present.
@@ -36,8 +36,8 @@ int main() {
         ASSERT_TRUE(output.find("open") != std::string::npos);
         ASSERT_TRUE(output.find("closed") != std::string::npos);
 
-        // Verify summary line.
-        ASSERT_TRUE(output.find("3 port(s) scanned.") != std::string::npos);
+        // Verify summary line with timing.
+        ASSERT_TRUE(output.find("3 port(s) scanned in 1.23s") != std::string::npos);
     }
 
     // --- Empty service shows dash ---

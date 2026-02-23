@@ -33,12 +33,41 @@ void print_result(std::ostream& os, const PortResult& result) {
        << '\n';
 }
 
-void print_results(std::ostream& os, const std::vector<PortResult>& results) {
+void print_results(std::ostream& os, const std::vector<PortResult>& results,
+                   double elapsed_seconds) {
+    // Count non-open ports to decide whether to filter output.
+    std::size_t closed_count = 0;
+    std::size_t filtered_count = 0;
+    for (const auto& r : results) {
+        if (r.state == PortState::Closed)        ++closed_count;
+        else if (r.state == PortState::Filtered) ++filtered_count;
+    }
+
+    // When scanning many ports, only show open ports (like nmap).
+    bool filter = results.size() > 100;
+
+    // Summary of hidden ports (before the table).
+    if (filter && (closed_count > 0 || filtered_count > 0)) {
+        os << "Not shown: ";
+        bool need_comma = false;
+        if (closed_count > 0) {
+            os << closed_count << " closed";
+            need_comma = true;
+        }
+        if (filtered_count > 0) {
+            if (need_comma) os << ", ";
+            os << filtered_count << " filtered";
+        }
+        os << "\n";
+    }
+
     print_header(os);
     for (const auto& r : results) {
+        if (filter && r.state != PortState::Open) continue;
         print_result(os, r);
     }
-    os << "\n" << results.size() << " port(s) scanned.\n";
+    os << "\n" << results.size() << " port(s) scanned in "
+       << std::fixed << std::setprecision(2) << elapsed_seconds << "s\n";
 }
 
 } // namespace synscan

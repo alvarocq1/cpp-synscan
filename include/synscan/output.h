@@ -45,7 +45,8 @@ void print_header(std::ostream& os);
 /// Print one result row.
 void print_result(std::ostream& os, const PortResult& result);
 
-/// Print a full table (header + all rows).
-void print_results(std::ostream& os, const std::vector<PortResult>& results);
+/// Print a full table (header + all rows + timing).
+void print_results(std::ostream& os, const std::vector<PortResult>& results,
+                   double elapsed_seconds);
 
 } // namespace synscan

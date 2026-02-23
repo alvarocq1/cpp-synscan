@@ -32,6 +32,16 @@ std::vector<uint16_t> parse_port_spec(std::string_view spec) {
     if (spec.empty()) {
         throw std::invalid_argument("port spec must not be empty");
     }
+
+    // "-" means all ports (1-65535), like nmap's -p-
+    if (spec == "-") {
+        std::vector<uint16_t> ports(65535);
+        for (uint32_t p = 1; p <= 65535; ++p) {
+            ports[p - 1] = static_cast<uint16_t>(p);
+        }
+        return ports;
+    }
+
     if (spec.front() == ',' || spec.back() == ',') {
         throw std::invalid_argument("invalid port list: leading/trailing comma");
     }
