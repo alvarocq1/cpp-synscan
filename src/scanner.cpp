@@ -12,6 +12,9 @@
 #include <string>
 #include <unordered_map>
 #include <cstdio>
+#ifdef __linux__
+#include <sys/socket.h>
+#endif
 
 namespace synscan {
 
@@ -99,6 +102,8 @@ std::vector<PortResult> run_scan(const ScanConfig& config) {
     // Classify replies into a state map as they arrive.
     std::unordered_map<uint16_t, PortState> state_map;
     state_map.reserve(config.ports.size());
+    std::unordered_map<uint16_t, uint16_t> probe_map; // src_port -> target_port
+    probe_map.reserve(config.ports.size() * 2);
 
     // Helper: drain all currently-available packets without blocking.
     auto drain_replies = [&]() {
@@ -111,8 +116,12 @@ std::vector<PortResult> run_scan(const ScanConfig& config) {
                 std::span<const uint8_t>(buf, static_cast<std::size_t>(n)),
                 expected_addr);
             if (reply) {
-                state_map[reply->source_port] =
-                    reply->is_syn_ack ? PortState::Open : PortState::Closed;
+                auto it = probe_map.find(reply->destination_port);
+                if (it != probe_map.end() && it->second == reply->source_port) {
+                    state_map[reply->source_port] =
+                        reply->is_syn_ack ? PortState::Open : PortState::Closed;
+                    probe_map.erase(it);
+                }
             }
         }
     };
@@ -128,6 +137,14 @@ std::vector<PortResult> run_scan(const ScanConfig& config) {
 
     std::vector<uint16_t> pending = config.ports;
 
+#ifdef __linux__
+    // Reusable batch buffers for sendmmsg path (avoid per-batch allocations).
+    std::vector<uint8_t> tx_batch_buf(kBatchSize * 40);
+    std::vector<struct iovec> tx_iov(kBatchSize);
+    std::vector<struct mmsghdr> tx_msgs(kBatchSize);
+    std::vector<struct sockaddr_in> tx_addrs(kBatchSize, dst_sockaddr);
+#endif
+
     for (int attempt = 0; attempt <= kMaxRetries && !pending.empty();
          ++attempt) {
         // Randomise scan order each round.
@@ -137,9 +154,50 @@ std::vector<PortResult> run_scan(const ScanConfig& config) {
         // between batches so the kernel's backlog doesn't overflow.
         for (std::size_t i = 0; i < pending.size(); i += kBatchSize) {
             std::size_t end = std::min(i + kBatchSize, pending.size());
+#ifdef __linux__
+            std::size_t count = end - i;
+
+            for (std::size_t j = 0; j < count; ++j) {
+                auto* b = tx_batch_buf.data() + (j * 40);
+                uint16_t src_port = 0;
+                auto len = build_syn_packet_fast(b, src_addr, dst_addr,
+                                                 pending[i + j], &src_port);
+                probe_map[src_port] = pending[i + j];
+                tx_iov[j].iov_base = b;
+                tx_iov[j].iov_len = len;
+                std::memset(&tx_msgs[j], 0, sizeof(tx_msgs[j]));
+                tx_msgs[j].msg_hdr.msg_iov = &tx_iov[j];
+                tx_msgs[j].msg_hdr.msg_iovlen = 1;
+                tx_msgs[j].msg_hdr.msg_name = &tx_addrs[j];
+                tx_msgs[j].msg_hdr.msg_namelen = sizeof(sockaddr_in);
+            }
+
+            int sent = sendmmsg(send_fd, tx_msgs.data(), static_cast<unsigned int>(count), 0);
+            if (sent < 0) {
+                close(send_fd);
+                close(recv_fd);
+                throw std::runtime_error(
+                    "sendmmsg failed — do you have CAP_NET_RAW or root?");
+            }
+            if (static_cast<std::size_t>(sent) < count) {
+                // Fallback-send anything unsent.
+                for (std::size_t j = static_cast<std::size_t>(sent); j < count; ++j) {
+                    if (!send_on_socket(send_fd,
+                                        static_cast<const uint8_t*>(tx_iov[j].iov_base),
+                                        tx_iov[j].iov_len,
+                                        tx_addrs[j])) {
+                        close(send_fd);
+                        close(recv_fd);
+                        throw std::runtime_error("send fallback failed");
+                    }
+                }
+            }
+#else
             for (std::size_t j = i; j < end; ++j) {
+                uint16_t src_port = 0;
                 auto len = build_syn_packet_fast(pkt_buf, src_addr,
-                                                  dst_addr, pending[j]);
+                                                  dst_addr, pending[j], &src_port);
+                probe_map[src_port] = pending[j];
                 if (!send_on_socket(send_fd, pkt_buf, len, dst_sockaddr)) {
                     close(send_fd);
                     close(recv_fd);
@@ -148,6 +206,7 @@ std::vector<PortResult> run_scan(const ScanConfig& config) {
                         "do you have CAP_NET_RAW or root?");
                 }
             }
+#endif
             drain_replies();
             if (i + kBatchSize < pending.size()) {
                 usleep(kBatchPauseUs);
@@ -184,8 +243,12 @@ std::vector<PortResult> run_scan(const ScanConfig& config) {
             auto batch = receive_responses(recv_fd, expected_addr,
                                            this_timeout);
             for (const auto& r : batch) {
-                state_map[r.source_port] =
-                    r.is_syn_ack ? PortState::Open : PortState::Closed;
+                auto it = probe_map.find(r.destination_port);
+                if (it != probe_map.end() && it->second == r.source_port) {
+                    state_map[r.source_port] =
+                        r.is_syn_ack ? PortState::Open : PortState::Closed;
+                    probe_map.erase(it);
+                }
             }
 
             if (state_map.size() == prev_count) {
@@ -215,8 +278,10 @@ std::vector<PortResult> run_scan(const ScanConfig& config) {
     if (state_map.size() < config.ports.size()) {
         for (uint16_t port : config.ports) {
             if (state_map.find(port) != state_map.end()) continue;
+            uint16_t src_port = 0;
             auto len = build_syn_packet_fast(pkt_buf, src_addr,
-                                              dst_addr, port);
+                                              dst_addr, port, &src_port);
+            probe_map[src_port] = port;
             if (send_on_socket(send_fd, pkt_buf, len, dst_sockaddr)) {
                 drain_replies();
             }

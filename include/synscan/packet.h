@@ -44,8 +44,9 @@ using RawPacket = std::vector<uint8_t>;
 
 /// A reply captured from the wire.
 struct ProbeReply {
-    uint16_t source_port;   // the remote port that replied
-    bool     is_syn_ack;    // true → port open;  false → RST (closed)
+    uint16_t source_port;        // remote port that replied
+    bool     is_syn_ack;         // true=open (SYN/ACK), false=closed (RST)
+    uint16_t destination_port{0}; // local dst port seen in the reply
 };
 
 // ---- Testable helpers (no sockets needed) ---------------------------------
@@ -85,7 +86,8 @@ struct ProbeReply {
 /// `buf` must point to at least 40 bytes.  Returns 40 (packet size).
 std::size_t build_syn_packet_fast(uint8_t* buf,
                                    uint32_t src_addr, uint32_t dst_addr,
-                                   uint16_t dst_port);
+                                   uint16_t dst_port,
+                                   uint16_t* out_src_port = nullptr);
 
 /// Open a raw socket suitable for sending SYN packets.
 /// On Linux: IPPROTO_RAW + IP_HDRINCL.
