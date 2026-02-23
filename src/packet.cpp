@@ -2,6 +2,7 @@
 #include "synscan/platform.h"
 
 #include <cstring>
+#include <cstdio>
 #include <ctime>
 #include <random>
 #include <stdexcept>
@@ -162,7 +163,7 @@ std::string resolve_source_ip(std::string_view dst_ip) {
 // ---------------------------------------------------------------------------
 
 std::optional<ProbeReply> parse_reply(std::span<const uint8_t> raw,
-                                       std::string_view expected_src_ip) {
+                                       uint32_t expected_src_addr) {
     if (raw.size() < 40) return std::nullopt;
 
     auto version = (raw[ip::VER_IHL] >> 4) & 0x0F;
@@ -172,14 +173,9 @@ std::optional<ProbeReply> parse_reply(std::span<const uint8_t> raw,
     if (ihl < 20 || raw.size() < ihl + 20) return std::nullopt;
     if (raw[ip::PROTOCOL] != IPPROTO_TCP) return std::nullopt;
 
-    uint32_t expected_addr = 0;
-    if (inet_pton(AF_INET, std::string(expected_src_ip).c_str(),
-                  &expected_addr) != 1) {
-        return std::nullopt;
-    }
     uint32_t pkt_src_addr = 0;
     std::memcpy(&pkt_src_addr, &raw[ip::SRC_ADDR], 4);
-    if (pkt_src_addr != expected_addr) return std::nullopt;
+    if (pkt_src_addr != expected_src_addr) return std::nullopt;
 
     const uint8_t* tcp_ptr = raw.data() + ihl;
     uint16_t src_port = static_cast<uint16_t>(tcp_ptr[0] << 8 | tcp_ptr[1]);
@@ -191,7 +187,18 @@ std::optional<ProbeReply> parse_reply(std::span<const uint8_t> raw,
 
     if (syn && ack) return ProbeReply{src_port, true};
     if (rst)        return ProbeReply{src_port, false};
+
     return std::nullopt;
+}
+
+std::optional<ProbeReply> parse_reply(std::span<const uint8_t> raw,
+                                       std::string_view expected_src_ip) {
+    uint32_t expected_addr = 0;
+    if (inet_pton(AF_INET, std::string(expected_src_ip).c_str(),
+                  &expected_addr) != 1) {
+        return std::nullopt;
+    }
+    return parse_reply(raw, expected_addr);
 }
 
 // ---------------------------------------------------------------------------
@@ -266,56 +273,44 @@ RawPacket build_syn_packet(std::string_view dst_ip, uint16_t dst_port,
 // send_packet — requires CAP_NET_RAW or root
 // ---------------------------------------------------------------------------
 
-bool send_packet(const RawPacket& packet, std::string_view dst_ip) {
+int open_sender() {
 #ifdef SYNSCAN_MACOS
-    // macOS: both IPPROTO_RAW and IPPROTO_TCP+IP_HDRINCL silently drop
-    // packets on the loopback interface.  The only reliable approach is
-    // IPPROTO_TCP *without* IP_HDRINCL — the kernel builds the IP header
-    // and we supply only the TCP segment.
-    //
-    // build_syn_packet() produces a full 40-byte IP+TCP packet.  We send
-    // only the TCP portion (bytes 20..39).
-    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
-    if (fd < 0) return false;
-
-    // Extract the TCP header (skip the 20-byte IP header).
-    if (packet.size() < ip::HDR_LEN + tcp::HDR_LEN) {
-        close(fd);
-        return false;
-    }
-    const uint8_t* tcp_data = packet.data() + ip::HDR_LEN;
-    std::size_t tcp_len = packet.size() - ip::HDR_LEN;
-
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    inet_pton(AF_INET, std::string(dst_ip).c_str(), &addr.sin_addr);
-
-    auto sent = sendto(fd, tcp_data, tcp_len, 0,
-                       reinterpret_cast<struct sockaddr*>(&addr),
-                       sizeof(addr));
-    close(fd);
-    return sent >= 0;
+    // macOS: IPPROTO_TCP without IP_HDRINCL — kernel builds the IP header.
+    return socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
 #else
     // Linux: IPPROTO_RAW + IP_HDRINCL works as expected.
     int fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-    if (fd < 0) return false;
+    if (fd < 0) return -1;
 
     int on = 1;
     if (setsockopt(fd, IPPROTO_IP, IP_HDRINCL, &on, sizeof(on)) < 0) {
         close(fd);
-        return false;
+        return -1;
     }
+    return fd;
+#endif
+}
 
+bool send_on_socket(int send_fd, const RawPacket& packet,
+                      std::string_view dst_ip) {
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     inet_pton(AF_INET, std::string(dst_ip).c_str(), &addr.sin_addr);
 
-    auto sent = sendto(fd, packet.data(), packet.size(), 0,
+#ifdef SYNSCAN_MACOS
+    // macOS: send only TCP portion (kernel adds IP header).
+    if (packet.size() < ip::HDR_LEN + tcp::HDR_LEN) return false;
+    const uint8_t* tcp_data = packet.data() + ip::HDR_LEN;
+    std::size_t tcp_len = packet.size() - ip::HDR_LEN;
+    auto sent = sendto(send_fd, tcp_data, tcp_len, 0,
                        reinterpret_cast<struct sockaddr*>(&addr),
                        sizeof(addr));
-    close(fd);
-    return sent >= 0;
+#else
+    auto sent = sendto(send_fd, packet.data(), packet.size(), 0,
+                       reinterpret_cast<struct sockaddr*>(&addr),
+                       sizeof(addr));
 #endif
+    return sent >= 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -432,7 +427,51 @@ int open_receiver(std::string_view dst_ip) {
 #else // Linux
 
 int open_receiver([[maybe_unused]] std::string_view dst_ip) {
-    return socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
+    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
+    if (fd < 0) return -1;
+
+    // Enlarge receive buffer to avoid drops during fast localhost scans.
+    int bufsz = 32 * 1024 * 1024; // 32 MB (kernel doubles this)
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &bufsz, sizeof(bufsz));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
+
+    // Attach a BPF socket filter to only accept SYN/ACK and RST packets.
+    // On localhost the raw socket receives our own outgoing SYN packets
+    // (doubling the packet volume to ~131K for a full-range scan), which
+    // overflows the receive buffer and causes most responses to be dropped.
+    // This filter eliminates bare-SYN and other irrelevant packets before
+    // they enter the socket buffer.
+    //
+    // Filter (operates on raw IP packets from IPPROTO_TCP socket):
+    //   0: LDB [0]       ; IP ver/IHL byte
+    //   1: AND #0x0F     ; mask IHL (in 32-bit words)
+    //   2: LSH #2        ; IHL * 4 = IP header length in bytes
+    //   3: TAX           ; X = IP header length
+    //   4: LDB [X+13]   ; TCP flags byte
+    //   5: JSET #0x04   ; RST set? → accept (instruction 9)
+    //   6: AND #0x12    ; mask SYN|ACK bits
+    //   7: JEQ #0x12    ; both SYN+ACK set? → accept (instruction 9)
+    //   8: RET #0        ; reject
+    //   9: RET #65535    ; accept
+    struct sock_filter bpf_code[] = {
+        { BPF_LD  | BPF_B   | BPF_ABS,  0, 0, 0     },
+        { BPF_ALU | BPF_AND | BPF_K,    0, 0, 0x0F  },
+        { BPF_ALU | BPF_LSH | BPF_K,    0, 0, 2     },
+        { BPF_MISC | BPF_TAX,           0, 0, 0     },
+        { BPF_LD  | BPF_B   | BPF_IND,  0, 0, 13    },
+        { BPF_JMP | BPF_JSET | BPF_K,   3, 0, 0x04  },
+        { BPF_ALU | BPF_AND | BPF_K,    0, 0, 0x12  },
+        { BPF_JMP | BPF_JEQ | BPF_K,    1, 0, 0x12  },
+        { BPF_RET | BPF_K,              0, 0, 0      },
+        { BPF_RET | BPF_K,              0, 0, 65535  },
+    };
+    struct sock_fprog bpf_prog = {
+        static_cast<unsigned short>(sizeof(bpf_code) / sizeof(bpf_code[0])),
+        bpf_code,
+    };
+    setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &bpf_prog, sizeof(bpf_prog));
+
+    return fd;
 }
 
 #endif
@@ -513,6 +552,9 @@ std::vector<ProbeReply> receive_responses(int recv_fd,
     }
 #else
     // Linux: read raw IP packets from the IPPROTO_TCP socket.
+    // After each poll() wakeup, drain ALL available packets with
+    // MSG_DONTWAIT before going back to poll.  This avoids the overhead
+    // of one poll() syscall per packet (critical for 65535-port scans).
     uint8_t buf[65536];
 
     while (true) {
@@ -526,14 +568,18 @@ std::vector<ProbeReply> receive_responses(int recv_fd,
         int ret = poll(&pfd, 1, remaining);
         if (ret <= 0) break;
 
-        auto n = recv(recv_fd, buf, sizeof(buf), 0);
-        if (n < 40) continue;
+        // Drain all buffered packets without blocking.
+        for (;;) {
+            auto n = recv(recv_fd, buf, sizeof(buf), MSG_DONTWAIT);
+            if (n < 0) break;   // EAGAIN — no more buffered packets
+            if (n < 40) continue;
 
-        auto reply = parse_reply(
-            std::span<const uint8_t>(buf, static_cast<std::size_t>(n)),
-            expected_src_ip);
-        if (reply) {
-            replies.push_back(*reply);
+            auto reply = parse_reply(
+                std::span<const uint8_t>(buf, static_cast<std::size_t>(n)),
+                expected_src_ip);
+            if (reply) {
+                replies.push_back(*reply);
+            }
         }
     }
 #endif

@@ -21,7 +21,7 @@ namespace synscan {
 ///   1. Resolve config.target to an IPv4 address (use getaddrinfo).
 ///   2. For each port in config.ports:
 ///        a. build_syn_packet(ip, port)
-///        b. send_packet(packet, ip)
+///        b. send_on_socket(send_fd, packet, ip)
 ///      (Batch sends for speed, then collect replies.)
 ///   3. receive_responses(ip, timeout) to gather replies.
 ///   4. Classify each port:

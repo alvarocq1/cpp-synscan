@@ -8,9 +8,9 @@
 //                            IPv4 datagram, computing the IP and TCP
 //                            checksums correctly.
 //
-//   2. send_packet()       — open a raw socket (AF_INET, SOCK_RAW,
-//                            IPPROTO_RAW) and transmit the packet.
-//                            Requires CAP_NET_RAW or root.
+//   2. open_sender() / send_on_socket()
+//                          — open a raw send socket once and reuse it
+//                            for all probes.  Requires CAP_NET_RAW or root.
 //
 //   3. open_receiver()     — create a raw socket for capturing TCP replies.
 //                            Must be called BEFORE sending probes so that
@@ -63,6 +63,12 @@ struct ProbeReply {
     std::span<const uint8_t> raw,
     std::string_view expected_src_ip);
 
+/// Fast overload: takes a pre-parsed network-order IPv4 address to avoid
+/// repeated inet_pton() calls in hot loops (critical for 65K-port scans).
+[[nodiscard]] std::optional<ProbeReply> parse_reply(
+    std::span<const uint8_t> raw,
+    uint32_t expected_src_addr);
+
 // ---- Core packet functions ------------------------------------------------
 
 /// Build a raw IPv4/TCP SYN packet targeting `dst_ip:dst_port`.
@@ -72,10 +78,16 @@ struct ProbeReply {
                                          uint16_t dst_port,
                                          std::string_view src_ip);
 
-/// Send a pre-built raw packet to the network.
-/// Requires CAP_NET_RAW or root. Returns true on success.
-[[nodiscard]] bool send_packet(const RawPacket& packet,
-                                std::string_view dst_ip);
+/// Open a raw socket suitable for sending SYN packets.
+/// On Linux: IPPROTO_RAW + IP_HDRINCL.
+/// On macOS: IPPROTO_TCP (kernel builds IP header for loopback).
+/// Returns the file descriptor, or -1 on failure.
+[[nodiscard]] int open_sender();
+
+/// Send a pre-built raw packet on an already-open send socket.
+/// Returns true on success.
+[[nodiscard]] bool send_on_socket(int send_fd, const RawPacket& packet,
+                                   std::string_view dst_ip);
 
 /// Open a receiver for capturing TCP packets.
 /// On Linux: a raw socket (AF_INET, SOCK_RAW, IPPROTO_TCP).

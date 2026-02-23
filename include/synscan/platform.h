@@ -57,6 +57,7 @@
 #ifdef SYNSCAN_LINUX
 #   include <netinet/ip.h>
 #   include <netinet/tcp.h>
+#   include <linux/filter.h>
 #endif
 
 #ifdef SYNSCAN_MACOS
