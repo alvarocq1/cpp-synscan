@@ -60,5 +60,31 @@ int main() {
         ASSERT_THROWS(call_parse(args), std::runtime_error);
     }
 
+    // --- "-p-" (single token) sets all_ports ---
+    {
+        const char* args[] = {"synscan", "-p-", "10.0.0.1"};
+        auto cfg = call_parse(args);
+        ASSERT_TRUE(cfg.has_value());
+        ASSERT_EQ(cfg->all_ports, true);
+        ASSERT_EQ(cfg->ports.size(), 65535u);
+    }
+
+    // --- "-p -" (two tokens) sets all_ports ---
+    {
+        const char* args[] = {"synscan", "-p", "-", "10.0.0.1"};
+        auto cfg = call_parse(args);
+        ASSERT_TRUE(cfg.has_value());
+        ASSERT_EQ(cfg->all_ports, true);
+        ASSERT_EQ(cfg->ports.size(), 65535u);
+    }
+
+    // --- Normal -p does not set all_ports ---
+    {
+        const char* args[] = {"synscan", "-p", "80", "10.0.0.1"};
+        auto cfg = call_parse(args);
+        ASSERT_TRUE(cfg.has_value());
+        ASSERT_EQ(cfg->all_ports, false);
+    }
+
     RUN_TESTS();
 }

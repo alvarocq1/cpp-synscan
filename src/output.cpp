@@ -34,7 +34,7 @@ void print_result(std::ostream& os, const PortResult& result) {
 }
 
 void print_results(std::ostream& os, const std::vector<PortResult>& results,
-                   double elapsed_seconds) {
+                   double elapsed_seconds, bool filter_closed) {
     // Count non-open ports to decide whether to filter output.
     std::size_t closed_count = 0;
     std::size_t filtered_count = 0;
@@ -44,7 +44,7 @@ void print_results(std::ostream& os, const std::vector<PortResult>& results,
     }
 
     // When scanning many ports, only show open ports (like nmap).
-    bool filter = results.size() > 100;
+    bool filter = filter_closed || results.size() > 100;
 
     // Summary of hidden ports (before the table).
     if (filter && (closed_count > 0 || filtered_count > 0)) {
@@ -62,10 +62,13 @@ void print_results(std::ostream& os, const std::vector<PortResult>& results,
     }
 
     print_header(os);
+    size_t shown = 0;
     for (const auto& r : results) {
         if (filter && r.state != PortState::Open) continue;
         print_result(os, r);
+        ++shown;
     }
+
     os << "\n" << results.size() << " port(s) scanned in "
        << std::fixed << std::setprecision(2) << elapsed_seconds << "s\n";
 }

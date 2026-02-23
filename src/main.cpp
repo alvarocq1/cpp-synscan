@@ -32,9 +32,9 @@ int main(int argc, char* argv[]) {
                           << *config->output_file << "\n";
                 return 1;
             }
-            synscan::print_results(ofs, results, elapsed);
+            synscan::print_results(ofs, results, elapsed, config->all_ports);
         } else {
-            synscan::print_results(std::cout, results, elapsed);
+            synscan::print_results(std::cout, results, elapsed, config->all_ports);
         }
 
         return 0;

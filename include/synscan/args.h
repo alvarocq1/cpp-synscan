@@ -26,6 +26,7 @@ struct ScanConfig {
     std::vector<uint16_t> ports;           // parsed port list
     std::optional<std::string> output_file;// write results here (nullopt → stdout)
     bool verbose = false;
+    bool all_ports = false;               // true when -p- (all 65535 ports)
 };
 
 /// Parse command-line arguments into a ScanConfig.

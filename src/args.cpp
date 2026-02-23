@@ -40,11 +40,22 @@ std::optional<ScanConfig> parse_args(int argc, char* argv[]) {
             continue;
         }
 
+        if (arg == "-p-") {
+            config.ports = parse_port_spec("-");
+            config.all_ports = true;
+            got_ports = true;
+            continue;
+        }
+
         if (arg == "-p") {
             if (++i >= argc) {
                 throw std::runtime_error("-p requires a port specification");
             }
-            config.ports = parse_port_spec(argv[i]);
+            std::string_view port_spec = argv[i];
+            config.ports = parse_port_spec(port_spec);
+            if (port_spec == "-") {
+                config.all_ports = true;
+            }
             got_ports = true;
             continue;
         }

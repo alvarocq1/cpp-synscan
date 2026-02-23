@@ -40,6 +40,42 @@ int main() {
         ASSERT_TRUE(output.find("3 port(s) scanned in 1.23s") != std::string::npos);
     }
 
+    // --- filter_closed hides closed ports ---
+    {
+        std::vector<PortResult> results = {
+            {22,  PortState::Open,   "ssh"},
+            {80,  PortState::Closed, "http"},
+            {443, PortState::Open,   "https"},
+        };
+        std::ostringstream oss;
+        print_results(oss, results, 0.50, true);
+        std::string output = oss.str();
+
+        // Open ports should appear.
+        ASSERT_TRUE(output.find("22/tcp") != std::string::npos);
+        ASSERT_TRUE(output.find("443/tcp") != std::string::npos);
+
+        // Closed port 80 should NOT appear as a row.
+        ASSERT_TRUE(output.find("80/tcp") == std::string::npos);
+
+        // Summary should mention "Not shown" and timing.
+        ASSERT_TRUE(output.find("Not shown:") != std::string::npos);
+        ASSERT_TRUE(output.find("3 port(s) scanned in") != std::string::npos);
+    }
+
+    // --- filter_closed=false still shows all ---
+    {
+        std::vector<PortResult> results = {
+            {22,  PortState::Open,   "ssh"},
+            {80,  PortState::Closed, "http"},
+        };
+        std::ostringstream oss;
+        print_results(oss, results, 2.00, false);
+        std::string output = oss.str();
+        ASSERT_TRUE(output.find("80/tcp") != std::string::npos);
+        ASSERT_TRUE(output.find("2 port(s) scanned in") != std::string::npos);
+    }
+
     // --- Empty service shows dash ---
     {
         std::ostringstream oss;

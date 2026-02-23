@@ -46,7 +46,8 @@ void print_header(std::ostream& os);
 void print_result(std::ostream& os, const PortResult& result);
 
 /// Print a full table (header + all rows + timing).
+/// When filter_closed is true, closed ports are omitted from the output.
 void print_results(std::ostream& os, const std::vector<PortResult>& results,
-                   double elapsed_seconds);
+                   double elapsed_seconds, bool filter_closed = false);
 
 } // namespace synscan

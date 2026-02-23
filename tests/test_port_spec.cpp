@@ -72,6 +72,14 @@ int main() {
         ASSERT_EQ(ports[1], 65535);
     }
 
+    // --- All ports via "-" (nmap -p-) ---
+    {
+        auto ports = parse_port_spec("-");
+        ASSERT_EQ(ports.size(), 65535u);
+        ASSERT_EQ(ports[0], 1);
+        ASSERT_EQ(ports[65534], 65535);
+    }
+
     // --- Error cases ---
     ASSERT_THROWS((void)parse_port_spec(""), std::invalid_argument);
     ASSERT_THROWS((void)parse_port_spec("0"), std::invalid_argument);
